@@ -317,6 +317,40 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+# Response headers that describe how the *upstream* framed its body on the
+# wire, not what the payload means. Every one of them is invalid to replay:
+# Starlette recomputes content-length, and uvicorn owns the connection
+# framing. Forwarding a stale ``transfer-encoding: chunked`` onto a
+# fixed-length body is the worst of them — RFC 9112 §6.1 makes
+# Transfer-Encoding override Content-Length, so the client tries to parse a
+# plain JSON body as chunked frames, finds no valid chunk-size line, and
+# reads an empty body out of an HTTP 200 (#3019).
+FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+)
+
+
+def sanitize_forwarded_response_headers(
+    headers: Any,
+    *extra_names: str,
+) -> dict[str, str]:
+    """Drop wire-framing headers before replaying an upstream response.
+
+    Pass any additional header names to strip as ``extra_names`` (for
+    example ``"content-type"`` when the caller sets its own media type).
+
+    Matching is case-insensitive, but the casing of the headers that
+    survive is left untouched.
+    """
+    drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
+    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -327,12 +361,18 @@ def log_outbound_request(
     mutation_reasons: list[str],
     request_id: str | None,
     source: str,
+    dropped_mutation_reasons: tuple[str, ...] | list[str] | None = None,
 ) -> None:
     """Structured log line for every outbound forwarder call.
 
     Per realignment build constraints: every cache-affecting decision is
     logged. Never includes ``Authorization``/``x-api-key`` content or full
     body bytes.
+
+    ``dropped_mutation_reasons`` records edits that byte-faithful passthrough
+    discarded before the wire. That is a WARNING, not a detail: the line above
+    reports the transforms Headroom *decided* on, and without this the operator
+    reads savings and injections that the upstream never saw.
     """
     logger.info(
         "event=outbound_request forwarder=%s method=%s path=%s body_bytes=%d "
@@ -346,6 +386,16 @@ def log_outbound_request(
         source,
         request_id or "",
     )
+    if dropped_mutation_reasons:
+        logger.warning(
+            "event=outbound_body_mutations_dropped forwarder=%s source=%s "
+            "dropped_mutation_reasons=%s request_id=%s (signed thinking blocks force "
+            "byte-faithful passthrough, so these body edits did NOT reach upstream)",
+            forwarder,
+            source,
+            ",".join(dropped_mutation_reasons),
+            request_id or "",
+        )
 
 
 def count_cache_breakpoints(
@@ -827,6 +877,130 @@ def append_text_to_latest_user_chat_message(
     return messages, 0
 
 
+# Anthropic wire contract: the system prompt lives in the top-level ``system``
+# parameter; a ``role="system"`` entry inside ``messages`` is rejected with a
+# 400 ("messages.0: use the top-level 'system' parameter ..."). ``role`` /
+# ``content`` / ``type`` are bare wire keys used throughout this module; only
+# the load-bearing values are named here.
+_ROLE_SYSTEM = "system"
+_TEXT_BLOCK_TYPE = "text"
+
+
+def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
+    """Convert a ``role="system"`` message into Anthropic system content blocks."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return [{"type": _TEXT_BLOCK_TYPE, "text": content}] if content else []
+    if isinstance(content, list):
+        blocks: list[Any] = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(block)
+            elif isinstance(block, str) and block:
+                blocks.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+        return blocks
+    return []
+
+
+def relocate_system_messages_to_top_level(
+    messages: list[dict[str, Any]],
+    system: Any,
+    model: str | None = None,
+) -> tuple[list[dict[str, Any]], Any, bool]:
+    """Relocate only system messages invalid for the selected Anthropic model.
+
+    Supported models accept mid-conversation system sections after a user turn
+    (or an assistant server-tool result) when followed by an assistant turn or
+    placed at the end. Hoisting those changes semantics and invalidates the
+    cached prefix. The initial/invalid forms are still moved to the top-level
+    field as the issue-765 last-line wire-contract guard.
+
+    The relocated content is appended after any existing top-level ``system``
+    so wire order (system prompt, then conversation) is preserved and no content
+    is dropped.
+
+    Returns ``(clean_messages, new_system, changed)``. When no system-role
+    message is present the inputs pass through unchanged (``changed=False``) so
+    the common path is untouched.
+    """
+    model_id = str(model or "").lower()
+    supports_mid_conversation = any(
+        family in model_id
+        for family in (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        )
+    )
+
+    def _assistant_ends_in_server_tool_result(message: object) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        final = content[-1]
+        if not isinstance(final, dict):
+            return False
+        block_type = str(final.get("type") or "")
+        return block_type == "server_tool_use" or block_type.endswith("_tool_result")
+
+    system_indices: set[int] = set()
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            index += 1
+            continue
+
+        section_start = index
+        while (
+            index + 1 < len(messages)
+            and isinstance(messages[index + 1], dict)
+            and messages[index + 1].get("role") == _ROLE_SYSTEM
+        ):
+            index += 1
+        section_end = index
+
+        previous = messages[section_start - 1] if section_start > 0 else None
+        following = messages[section_end + 1] if section_end + 1 < len(messages) else None
+        valid_previous = (
+            isinstance(previous, dict) and previous.get("role") == "user"
+        ) or _assistant_ends_in_server_tool_result(previous)
+        valid_following = following is None or (
+            isinstance(following, dict) and following.get("role") == "assistant"
+        )
+        if not (supports_mid_conversation and valid_previous and valid_following):
+            system_indices.update(range(section_start, section_end + 1))
+        index += 1
+    if not system_indices:
+        return messages, system, False
+
+    relocated_blocks: list[Any] = []
+    for i in sorted(system_indices):
+        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
+
+    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+
+    if not relocated_blocks:
+        # System message(s) carried no content — drop the empty entries only.
+        return clean_messages, system, True
+
+    if system is None or system == "" or system == []:
+        new_system: Any = relocated_blocks
+    elif isinstance(system, str):
+        new_system = [{"type": _TEXT_BLOCK_TYPE, "text": system}, *relocated_blocks]
+    elif isinstance(system, list):
+        new_system = [*system, *relocated_blocks]
+    else:
+        # Unexpected shape — wrap rather than drop (safety-first: never lose content).
+        new_system = [system, *relocated_blocks]
+
+    return clean_messages, new_system, True
+
+
 def append_text_to_latest_user_input_item(
     body_input: list[dict[str, Any]],
     context_text: str,
@@ -887,6 +1061,18 @@ def append_text_to_latest_user_input_item(
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+
+# A *decompressed* body obeys the same ceiling as an uncompressed one. The
+# Content-Length gate at the handlers only ever saw the compressed wire size, so
+# a client could buy unlimited extra capacity with a compression ratio: ~2MB of
+# zeros expands to 2GB and the process dies allocating it (#3284). Same number,
+# deliberately: nobody should get more room by arriving gzipped.
+MAX_DECOMPRESSED_BODY_SIZE = MAX_REQUEST_BODY_SIZE
+
+# How much decompressed output to pull per step. The cap is re-checked after
+# every chunk, so the peak allocation is the limit plus one chunk — never the
+# full expansion of a bomb.
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
 
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
@@ -1071,8 +1257,54 @@ try:
 except ValueError:
     EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
 
-# Maximum compression cache sessions (prevents unbounded memory growth)
-MAX_COMPRESSION_CACHE_SESSIONS = 500
+# Maximum compression cache sessions (prevents unbounded memory growth).
+# Overridable via HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS for gateway
+# deployments (e.g. Kong sidecars) that fan many concurrent sessions into one
+# proxy process. Falls back to 500 on an unparseable value; floor of 1.
+try:
+    MAX_COMPRESSION_CACHE_SESSIONS = max(
+        1, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS", "500"))
+    )
+except ValueError:
+    MAX_COMPRESSION_CACHE_SESSIONS = 500
+
+# Idle TTL for per-session compression caches. Eviction is bust-free only
+# once the provider's own prompt cache has lapsed, so this must exceed the
+# LONGEST provider cache TTL Headroom serves — Anthropic's 1h extended
+# breakpoint (3600s), not just the common 5m ephemeral cache. Evicting
+# earlier would itself cause the bust this state exists to prevent: the
+# session returns, the provider still holds the old bytes, but the map that
+# replays them is gone. The cache must also outlive the prefix TRACKER's
+# session TTL (600s): after the tracker expires, `apply_cached`'s
+# byte-identical swap is the only thing still protecting the provider
+# prefix. Default 3900s = 1h + 5m grace. Deployments that never opt into
+# the 1h breakpoint can lower it via HEADROOM_COMPRESSION_CACHE_TTL_SECONDS.
+try:
+    # Floor of 600s: never below the prefix tracker's session TTL, or the
+    # sweep could reclaim the byte-identical swap map while it is the only
+    # remaining protection for a still-live provider prefix (see above).
+    # Non-finite floats ("nan"/"inf") parse but poison every idle comparison,
+    # so they are rejected like any other unparseable value.
+    _ttl_env = float(os.environ.get("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "3900"))
+    if _ttl_env != _ttl_env or _ttl_env in (float("inf"), float("-inf")):
+        raise ValueError("non-finite TTL")
+    COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
+except ValueError:
+    COMPRESSION_CACHE_TTL_SECONDS = 3900.0
+
+# Entries per session compression cache. 10k covers a single conversation with
+# ~2x headroom even at a 1M-token context (a compressible tool_result is at
+# least a few hundred tokens, so at most ~5k can be live at once). Raise via
+# HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES only for workloads that fan many
+# concurrent conversations into ONE session id (shared fallback ids, heavy
+# subagent fan-out) — entry LRU is hit-refreshed, so an undersized cap shows
+# up as misses on still-live entries, i.e. prefix-cache busts. Floor of 100.
+try:
+    COMPRESSION_CACHE_MAX_ENTRIES = max(
+        100, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "10000"))
+    )
+except ValueError:
+    COMPRESSION_CACHE_MAX_ENTRIES = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -1329,37 +1561,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -1428,15 +1687,40 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
-def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+def merge_extra_headers(
+    headers: dict[str, str],
+    extra: dict[str, str] | None,
+    *,
+    upstream_url: str | None,
+    config: Any = None,
+) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
     ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
     (settings-panel/CLI-configured, for gateways that need one extra header alongside the
     client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+
+    ``upstream_url`` is where these headers are about to be sent, and it is
+    **required** rather than optional on purpose. These values are secrets, and
+    several handlers accept a per-request upstream from the ``x-headroom-base-url``
+    request header; merging before the destination was known is what let a client
+    redirect the operator's gateway key to a host of its choosing. Making the
+    destination part of the signature means a new forwarder cannot merge a secret
+    without saying where it goes, so this cannot silently regress.
+
+    Pass ``None`` when the caller is going to its configured target with no
+    per-request override. Anything else is checked against
+    ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
+    request proxied, just without these headers.
     """
     if not extra:
         return headers
+    if upstream_url is not None:
+        from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
+
+        if not is_trusted_upstream(upstream_url, config):
+            warn_untrusted_once(upstream_url)
+            return headers
     # HTTP header names are case-insensitive: drop any existing key that
     # case-insensitively collides with a configured extra so the extra wins.
     # A plain {**headers, **extra} would emit both casings upstream.
@@ -2102,6 +2386,43 @@ def has_new_ccr_markers(
     )
 
 
+def history_references_ccr_tool(messages: Any) -> bool:
+    """True when the request history already contains a ``headroom_retrieve`` call.
+
+    Anthropic emits it as an assistant ``tool_use`` content block; OpenAI as an
+    assistant ``tool_calls[].function.name``. When such a reference is present in
+    history but the tool is not re-declared in ``tools``, the provider rejects
+    the whole request (``400 Tool reference 'headroom_retrieve' not found``,
+    #2440). Used to force sticky re-injection on the sessionless path.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == CCR_TOOL_NAME
+                ):
+                    return True
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                if name == CCR_TOOL_NAME:
+                    return True
+    return False
+
+
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -2109,6 +2430,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    history_has_ccr_reference: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2157,9 +2479,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    # No session_id (e.g. WS path): per-turn decision drives directly.
+    # No session_id (e.g. WS path): the per-turn flag drives the decision, but
+    # a headroom_retrieve tool_use already sitting in history must ALSO force
+    # re-injection. Without a session the tracker can't remember a prior turn's
+    # CCR, so a later turn with no fresh compression would drop the tool
+    # definition and the provider rejects the request because history still
+    # references it (#2440).
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not (has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2173,7 +2500,9 @@ def apply_session_sticky_ccr_tool(
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
-            decision="inject_first_time",
+            decision="inject_first_time"
+            if has_compressed_content_this_turn
+            else "inject_history_reference",
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2247,24 +2576,145 @@ def apply_session_sticky_ccr_tool(
     return tools_out, True
 
 
+class RequestBodyTooLarge(ValueError):
+    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` call site
+    keeps answering 400 unchanged, while giving a caller that would rather
+    answer 413 a type to branch on.
+    """
+
+
+def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
+    """Incrementally inflate ``raw``, stopping the instant output passes the cap.
+
+    ``zlib.decompress``/``gzip.decompress`` materialize the whole expansion
+    before anything can inspect it, which is what makes a bomb fatal. Feeding
+    the stream through ``decompressobj`` with a ``max_length`` keeps unproduced
+    output in ``unconsumed_tail`` instead of memory, so the check below runs
+    before the allocation rather than after it.
+    """
+    import zlib
+
+    out = bytearray()
+    pending = raw
+    first_member = True
+    while True:
+        if multi_member and not first_member:
+            # gzip is a *sequence* of members and CPython's reader skips NUL
+            # padding between and after them — real clients emit it, and
+            # `gzip.decompress(member + b"\x00" * 16)` returns the payload
+            # rather than raising. Parsing that padding as a fresh member
+            # would reject bodies the one-shot call accepted.
+            pending = pending.lstrip(b"\x00")
+        if multi_member and not pending:
+            # Either an empty body (`gzip.decompress(b"")` == b"") or a clean
+            # end after the last member. A body that is *only* padding never
+            # reaches here: `first_member` is still True, so it falls through
+            # to the header parse below and fails there, as CPython does.
+            break
+        decompressor = zlib.decompressobj(wbits)
+        while True:
+            chunk = decompressor.decompress(pending, _DECOMPRESS_CHUNK_SIZE)
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed {label} request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+            pending = decompressor.unconsumed_tail
+            if decompressor.eof or not pending:
+                break
+            if not chunk:
+                # Input left over but nothing produced: the stream cannot
+                # advance, and looping again would spin forever.
+                raise ValueError(f"Failed to decompress {label} request body: stalled stream")
+        out += decompressor.flush()
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed {label} request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        if not decompressor.eof:
+            raise ValueError(f"Failed to decompress {label} request body: truncated stream")
+        # gzip streams may carry several members; `gzip.decompress` concatenates
+        # them, so restart on the trailer to keep that behavior.
+        pending = decompressor.unused_data
+        first_member = False
+        if not multi_member:
+            break
+    return bytes(out)
+
+
+def _zstd_bounded(raw: bytes) -> bytes:
+    """Read a zstd frame in chunks so a high-ratio frame cannot outrun the cap."""
+    import zstandard
+
+    out = bytearray()
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(raw) as reader:
+        while True:
+            chunk = reader.read(_DECOMPRESS_CHUNK_SIZE)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed zstd request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+    return bytes(out)
+
+
+def _brotli_bounded(raw: bytes) -> bytes:
+    """Feed brotli input in slices, checking the cap after each one."""
+    import brotli
+
+    decompressor_cls = getattr(brotli, "Decompressor", None)
+    if decompressor_cls is None:
+        # Fail closed rather than fall back to the unbounded one-shot call: an
+        # old library is not a reason to reopen the hole.
+        raise ValueError(
+            "Installed 'brotli' is too old for incremental decompression "
+            "(needs brotli.Decompressor); upgrade it to accept br request bodies."
+        )
+
+    decompressor = decompressor_cls()
+    out = bytearray()
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed brotli request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    is_finished = getattr(decompressor, "is_finished", None)
+    if is_finished is not None and not is_finished():
+        raise ValueError("Failed to decompress brotli request body: truncated stream")
+    return bytes(out)
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure.
+    Raises ``ValueError`` on any decompression failure, and the
+    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
+    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
 
+    # Every branch below decompresses incrementally against
+    # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
+    # generic handlers so the size refusal is not reworded into a vague
+    # "failed to decompress" (#3284).
     if encoding in ("zstd", "zstandard"):
         try:
-            import zstandard
-
-            dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
+            raw = _zstd_bounded(raw)
+        except RequestBodyTooLarge:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is zstd-compressed but the 'zstandard' package is not installed. "
@@ -2273,24 +2723,30 @@ async def _read_request_body_bytes(request: Request) -> bytes:
         except Exception as exc:
             raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
     elif encoding == "gzip":
-        import gzip as _gzip
+        import zlib
 
         try:
-            raw = _gzip.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
+            # both already carrying the message we want.
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
     elif encoding == "deflate":
         import zlib
 
         try:
-            raw = zlib.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
         try:
-            import brotli
-
-            raw = brotli.decompress(raw)
+            raw = _brotli_bounded(raw)
+        except ValueError:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is brotli-compressed but the 'brotli' package is not installed."
@@ -2585,7 +3041,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 
@@ -2674,6 +3130,75 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+# Model-id shapes that name a Bedrock or Vertex deployment. The chat path
+# excludes those upstreams by base URL / backend (it knows where it forwards);
+# on the gateway contract the gateway routes, so the model id is the only
+# signal. Shared with the tool-search extension, which applies deferral on the
+# gateway path.
+_NON_FIRST_PARTY_MODEL_PREFIXES: tuple[str, ...] = (
+    "bedrock/",
+    "vertex_ai/",
+    "vertex/",
+    "anthropic.",  # bare Bedrock ids: anthropic.claude-3-5-sonnet-20241022-v2:0
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
+)
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+(:\d+)?$")
+
+
+def anthropic_model_is_first_party(model_name: str) -> bool:
+    """Whether ``model_name`` is a first-party Claude API id (not Bedrock/Vertex).
+
+    First-party tool search (``tool_search_tool_*`` + ``defer_loading``) is
+    rejected by Bedrock and Vertex, which the chat path skips by upstream URL.
+    Gateway callers name those deployments in the model id instead:
+    ``bedrock/anthropic.claude-…``, ``anthropic.claude-…-v2:0``,
+    ``vertex_ai/claude-…``, ``claude-sonnet-4@20250514``. A LiteLLM-style
+    ``anthropic/claude-…`` prefix is first-party and stays eligible.
+    """
+    lowered = (model_name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_NON_FIRST_PARTY_MODEL_PREFIXES):
+        return False
+    if "@" in lowered:  # Vertex dated ids
+        return False
+    return not _BEDROCK_VERSION_SUFFIX.search(lowered)
+
+
+def tools_are_anthropic_shaped(tools: Any) -> bool:
+    """Every dict tool is Anthropic-shaped (top-level ``name``/``input_schema``
+    or a typed server tool), and none carries the OpenAI ``function`` wrapper.
+
+    ``provider`` is inferred from the model name, and a LiteLLM-style caller
+    can pair a Claude model with chat-completions tools; deferral must not
+    touch those (Anthropic would never see this shape as-is anyway).
+    """
+    if not isinstance(tools, list) or not tools:
+        return False
+    saw_real_tool = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        if "function" in tool:
+            return False
+        if tool.get("type"):
+            continue  # typed server tool (web_search, computer, …)
+        if not tool.get("name") or "input_schema" not in tool:
+            return False
+        saw_real_tool = True
+    return saw_real_tool
+
+
+def _tool_search_resident_key(name: Any) -> str:
+    """Normalize a client tool name for resident-tool membership checks."""
+    # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
+    # markers so internal separators such as ``mcp__server__read`` stay intact.
+    return str(name or "").lower().lstrip("_")
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -2721,8 +3246,9 @@ def inject_tool_search_deferral(
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        if isinstance(tool, dict) and (
+            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         ):
             return tools  # client already uses tool search — leave it alone
 
@@ -2734,17 +3260,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
-    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
-    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
-    # the exemption applies to both — an exact match silently deferred *every*
-    # tool for PascalCase clients, including their own tool-search tool.
-    core_lower = {name.lower() for name in core_tools}
+    # Clients disagree on casing and leading namespace markers for the same tool:
+    # Claude Code sends ``Bash``, opencode sends ``bash``, and Oh My Pi sends
+    # ``_bash``. Normalize both the configured names and each candidate so the
+    # exemption applies consistently across clients.
+    core_keys = {_tool_search_resident_key(name) for name in core_tools}
 
     for tool in tools:
         if (
             not isinstance(tool, dict)
             or tool.get("type")
-            or str(tool.get("name") or "").lower() in core_lower
+            or _tool_search_resident_key(tool.get("name")) in core_keys
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
@@ -2821,23 +3347,56 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+# Stand-in for a tool-search block the outbound tools array cannot support. Text
+# so it is inert to every validator, short so it costs ~10 tokens, and constant so
+# the repaired prefix stays byte-stable across turns (the provider cache needs the
+# same bytes every time).
+_TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
+    "type": "text",
+    "text": "[tool search omitted: unavailable in this request]",
+}
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
-    """Drop tool-search blocks this request's ``tools`` array cannot support.
+    """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
     A block pair is unsupportable when the request carries no ``tool_search_tool_*``
     tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
     shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    ``server_tool_use`` are handled (an orphan of either 400s on its own).
 
-    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
-    when nothing was removed — callers rely on identity to skip the write-back.
+    Replace in place rather than remove (#3456). The block indexes of a message
+    are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
+    by ``(message_index, block_index)``, so deleting a block that sits BEFORE a
+    thinking block in the same message — or deleting a whole message ahead of one —
+    moves that block, ``thinking_blocks_survived_mutation`` reports False, and
+    ``select_outbound_body`` then forwards the client's ORIGINAL bytes and discards
+    every mutation, this repair included. The request that needed repairing is
+    exactly the one that loses it, and upstream 400s on the reference we had
+    already found. Swapping each block for a short text block keeps every thinking
+    block at its original coordinates, so the repair survives to the wire. Same
+    reasoning as the CCR sibling below.
+
+    Returns ``(messages, blocks_repaired)``, and the ORIGINAL ``messages`` object
+    when nothing changed — callers rely on identity to skip the write-back.
     """
     if not isinstance(messages, list):
         return messages, 0
 
     tool_list = tools if isinstance(tools, list) else []
-    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # Typed search tools (type starts with "tool_search_tool_") are the search
+    # mechanism itself — they are never the target of a tool_reference lookup.
+    # Excluding them from `available` ensures that a stale history entry that
+    # references "tool_search_tool_regex" (from a turn where inject deferred a
+    # typeless client tool with that name) is correctly dropped rather than
+    # falsely kept because the injected typed search tool shares the same name.
+    available = {
+        str(t["name"])
+        for t in tool_list
+        if isinstance(t, dict)
+        and t.get("name")
+        and not str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+    }
     has_search_tool = any(
         isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         for t in tool_list
@@ -2852,7 +3411,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             out.append(message)
             continue
 
-        drop_indexes: set[int] = set()
+        neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
         for index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
@@ -2860,7 +3419,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
                 continue
-            drop_indexes.add(index)
+            neutralize_indexes.add(index)
             use_id = block.get("tool_use_id")
             if use_id:
                 orphaned_ids.add(str(use_id))
@@ -2872,22 +3431,142 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                 continue
             is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
-                drop_indexes.add(index)
+                neutralize_indexes.add(index)
 
-        if not drop_indexes:
+        if not neutralize_indexes:
             out.append(message)
             continue
 
         changed = True
-        removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
-        if not kept:
-            continue  # the whole turn was tool-search bookkeeping
+        removed += len(neutralize_indexes)
         repaired = dict(message)
-        repaired["content"] = kept
+        repaired["content"] = [
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            for index, block in enumerate(content)
+        ]
         out.append(repaired)
 
     return (out, removed) if changed else (messages, 0)
+
+
+def _ccr_result_as_text(block: dict[str, Any]) -> str:
+    """Flatten a ``tool_result`` block's content to plain text, preserving what
+    the model already saw. Falls back to a short placeholder when there is no
+    textual content to keep."""
+    content = block.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        joined = "\n".join(part for part in parts if part)
+        if joined.strip():
+            return joined
+    return "[headroom_retrieve result omitted]"
+
+
+def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Neutralize ``headroom_retrieve`` history references the outbound ``tools``
+    array cannot support.
+
+    Claude Code replays one transcript across requests that carry different
+    ``tools`` arrays, and Anthropic validates every history ``tool_use`` against
+    the array of the request at hand. A passthrough side-request (the prompt-type
+    Stop hook evaluator, ``/compact``) that the proxy forwards without declaring
+    ``headroom_retrieve`` then 400s on a historical ``tool_use`` that names it --
+    the CCR sibling of the tool-search history repair (#2814 / #2807). This is
+    belt-and-braces with the injection-side fixes: they keep the tool available
+    where it belongs; this makes the 400 structurally impossible where it cannot.
+
+    When the request does NOT declare ``headroom_retrieve``, replace each
+    ``headroom_retrieve`` ``tool_use`` block and its paired ``tool_result`` with a
+    text block, so no dangling reference survives. Neutralize rather than drop:
+    CCR's ``tool_use`` (an assistant turn) and its ``tool_result`` (the next user
+    turn) live in DIFFERENT messages, so removing a message could leave two
+    same-role messages adjacent and break Anthropic's user/assistant alternation.
+    Replacing blocks in place keeps every message and role intact, and preserves
+    the retrieved text the model already saw.
+
+    Returns ``(messages, blocks_neutralized)``, and the ORIGINAL ``messages``
+    object when nothing changed -- callers rely on identity to skip the write-back.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # The tool is declared this turn (e.g. the main loop, or sticky re-injection),
+    # so its history references resolve. Nothing to repair.
+    if CCR_TOOL_NAME in available:
+        return messages, 0
+
+    # First pass: collect the ids of headroom_retrieve tool_use blocks so their
+    # paired tool_result blocks (in a later user turn) can be matched.
+    retrieve_ids: set[str] = set()
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == CCR_TOOL_NAME
+            ):
+                use_id = block.get("id")
+                if use_id:
+                    retrieve_ids.add(str(use_id))
+
+    if not retrieve_ids:
+        return messages, 0
+
+    out: list[Any] = []
+    neutralized = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        new_content: list[Any] = []
+        touched = False
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use" and block.get("name") == CCR_TOOL_NAME:
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": "[headroom_retrieve call omitted: tool not available this turn]",
+                        }
+                    )
+                    neutralized += 1
+                    touched = True
+                    continue
+                if (
+                    block.get("type") == "tool_result"
+                    and str(block.get("tool_use_id", "")) in retrieve_ids
+                ):
+                    new_content.append({"type": "text", "text": _ccr_result_as_text(block)})
+                    neutralized += 1
+                    touched = True
+                    continue
+            new_content.append(block)
+
+        if touched:
+            changed = True
+            repaired = dict(message)
+            repaired["content"] = new_content
+            out.append(repaired)
+        else:
+            out.append(message)
+
+    return (out, neutralized) if changed else (messages, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2989,10 +3668,10 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
-    # Case-insensitive for the same reason as the Anthropic path above: the
-    # resident-name sets are lowercase, clients are not required to be.
-    resident_lower = {name.lower() for name in core_tools} | {
-        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    # Normalize for the same reason as the Anthropic path above: clients may use
+    # different casing or a leading namespace marker for the same resident tool.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
+        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
     }
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3003,7 +3682,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and _tool_search_resident_key(tool.get("name")) not in resident_keys
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)
